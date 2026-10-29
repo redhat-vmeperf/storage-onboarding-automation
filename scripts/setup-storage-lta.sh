@@ -60,7 +60,7 @@ PLATFORM_DIGITS=(
     [ibm]=1
     [netapp-asa]=3
     [pure]=5
-    [netapp-a300]=7
+    [netapp-aff]=7
 )
 
 declare -A PLATFORM_NAMES
@@ -68,7 +68,7 @@ PLATFORM_NAMES=(
     [ibm]="IBM FlashSystem 7300"
     [netapp-asa]="NetApp ASA A70"
     [pure]="Pure FlashArray X70R5"
-    [netapp-a300]="NetApp AFF A300"
+    [netapp-aff]="NetApp AFF A300"
 )
 
 # =============================================================================
@@ -143,8 +143,8 @@ MULTIPATH_NETAPP='devices {
 # =============================================================================
 # Logging
 # =============================================================================
-log()         { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >&2; [[ -n "${LOG_FILE:-}" ]] && echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"; }
-log_verbose() { [[ "$VERBOSE" == "true" ]] && log "[VERBOSE] $*"; }
+log()         { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >&2; if [[ -n "${LOG_FILE:-}" ]]; then echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"; fi; }
+log_verbose() { if [[ "$VERBOSE" == "true" ]]; then log "[VERBOSE] $*"; fi; }
 log_error()   { log "[ERROR] $*"; }
 log_success() { log "[OK] $*"; }
 log_warn()    { log "[WARN] $*"; }
@@ -596,12 +596,18 @@ generate_nncp_yaml() {
     local profile="vlan${vlan_id}"
     local vendor_name="${PLATFORM_NAMES[$vendor]:-$vendor}"
 
+    # Per-node NNCPs need unique names; include hostname when targeting a specific node
+    local nncp_name="${cloud_name}-${profile}-storage-lta"
+    if [[ "$node_selector_key" == "kubernetes.io/hostname" ]]; then
+        nncp_name="${cloud_name}-${node_selector_value}-${profile}-storage-lta"
+    fi
+
     cat <<EOF
 ---
 apiVersion: nmstate.io/v1
 kind: NodeNetworkConfigurationPolicy
 metadata:
-  name: ${cloud_name}-${profile}-storage-lta
+  name: ${nncp_name}
   labels:
     storage-lta/cloud: "${cloud_name}"
     storage-lta/vendor: "${vendor}"
@@ -824,7 +830,7 @@ setup_multipath_vendor_ocp() {
             config_block="$MULTIPATH_PURE"
             vendor_pattern='vendor.*"PURE"'
             ;;
-        netapp-asa|netapp-a300)
+        netapp-asa|netapp-aff)
             config_block="$MULTIPATH_NETAPP"
             vendor_pattern='vendor.*"NETAPP"'
             ;;
@@ -950,7 +956,7 @@ setup_multipath_vendor_ssh() {
             config_block="$MULTIPATH_PURE"
             vendor_pattern='vendor.*"PURE"'
             ;;
-        netapp-asa|netapp-a300)
+        netapp-asa|netapp-aff)
             config_block="$MULTIPATH_NETAPP"
             vendor_pattern='vendor.*"NETAPP"'
             ;;
@@ -1098,17 +1104,27 @@ do_host_setup() {
 # BWS credential helpers (Bitwarden Secrets Manager CLI)
 # =============================================================================
 _BWS_CACHE=""
+bws_load_cache() {
+    if ! command -v bws &>/dev/null; then
+        log_error "bws CLI not found. Install Bitwarden Secrets Manager CLI."
+        return 1
+    fi
+    # Keep only storage credentials in the cache; set BWS_PROJECT_ID to
+    # scope the list call to a dedicated project.
+    local -a bws_list=(bws secret list -o json)
+    if [[ -n "${BWS_PROJECT_ID:-}" ]]; then
+        bws_list+=("${BWS_PROJECT_ID}")
+    fi
+    _BWS_CACHE=$("${bws_list[@]}" 2>/dev/null \
+        | jq '[.[] | select(.key | startswith("STORAGE_"))]') || {
+        log_error "bws secret list failed. Ensure BWS_ACCESS_TOKEN is set."
+        return 1
+    }
+}
 bws_get() {
     local key="$1"
     if [[ -z "$_BWS_CACHE" ]]; then
-        if ! command -v bws &>/dev/null; then
-            log_error "bws CLI not found. Install Bitwarden Secrets Manager CLI."
-            return 1
-        fi
-        _BWS_CACHE=$(bws secret list -o json 2>/dev/null) || {
-            log_error "bws secret list failed. Ensure BWS_ACCESS_TOKEN is set."
-            return 1
-        }
+        bws_load_cache || return 1
     fi
     echo "$_BWS_CACHE" | jq -r --arg k "$key" '.[] | select(.key == $k) | .value'
 }
@@ -1131,7 +1147,7 @@ storage_ssh() {
             host=$(bws_get "STORAGE_NETAPP_ASA_MGMT_IP")
             user=$(bws_get "STORAGE_NETAPP_ASA_USER")
             pw=$(bws_get "STORAGE_NETAPP_ASA_PW") ;;
-        netapp-a300)
+        netapp-aff)
             host=$(bws_get "STORAGE_NETAPP_AFF_MGMT_IP")
             user=$(bws_get "STORAGE_NETAPP_AFF_USER")
             pw=$(bws_get "STORAGE_NETAPP_AFF_MGMT_PW") ;;
@@ -1150,7 +1166,10 @@ storage_ssh() {
     fi
 
     log_verbose "  storage_ssh ${vendor} (${host}): $*"
-    sshpass -p "$pw" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 "${user}@${host}" "$@"
+    # PubkeyAuthentication=no: arrays authenticate via password only; a local
+    # ssh-agent key the array doesn't know makes some arrays (IBM Storage
+    # Virtualize: CMMVC7016E) abort the connection instead of falling back.
+    sshpass -p "$pw" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o PubkeyAuthentication=no "${user}@${host}" "$@"
 }
 
 # =============================================================================
@@ -1201,7 +1220,11 @@ collect_worker_iqns() {
         done
     fi
 
-    printf '%s\n' "${iqns[@]}"
+    # Guard: printf '%s\n' with an empty array still emits one blank line,
+    # which mapfile would turn into a phantom empty "worker:iqn" pair.
+    if (( ${#iqns[@]} > 0 )); then
+        printf '%s\n' "${iqns[@]}"
+    fi
 }
 
 # =============================================================================
@@ -1266,70 +1289,117 @@ storage_setup_netapp_asa() {
     local port_a="e1b"
     local port_b="e7b"
 
-    # --- Sub-stage A: verify or create IPspace, SVM, LIFs ---
-    log "  [A] Checking IPspace and SVM..."
-    local svm_exists
-    svm_exists=$(storage_ssh netapp-asa "vserver show -vserver ${svm} -fields vserver" 2>/dev/null | grep -c "${svm}" || true)
+    # --- Sub-stage A: verify or create IPspace, broadcast domains, VLAN ports, SVM, LIFs ---
+    log "  [A] Checking IPspace, broadcast domains, VLAN ports, SVM, and LIFs..."
 
-    if [[ "$svm_exists" -gt 0 ]]; then
-        log_success "  SVM ${svm} already exists"
-        # Verify LIFs
-        local lif_output
-        lif_output=$(storage_ssh netapp-asa "network interface show -vserver ${svm} -fields address,status-oper" 2>/dev/null) || true
-        log "  LIF status:"
-        echo "$lif_output" | grep -E "iscsi|${cloud_name}" | while IFS= read -r line; do
-            log "    $line"
-        done
+    local vlanA="${vlan_ids[0]}"
+    local vlanB="${vlan_ids[1]}"
+    local subA="${subnet_bases[0]}"
+    local subB="${subnet_bases[1]}"
+    local bd_a="bd_${cloud_name}_a"
+    local bd_b="bd_${cloud_name}_b"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log "[DRY-RUN] Would ensure: ipspace ${ipspace}, broadcast domains, VLAN ports, SVM ${svm}, 4 LIFs"
     else
-        log "  Creating IPspace, broadcast domains, VLAN ports, SVM, and LIFs..."
-
-        if [[ "$DRY_RUN" == "true" ]]; then
-            log "[DRY-RUN] Would create: ipspace ${ipspace}, broadcast domains, VLAN ports, SVM ${svm}, 4 LIFs"
+        # Step 1: IPspace (checked independently)
+        local ipspace_check
+        ipspace_check=$(storage_ssh netapp-asa "ipspace show -ipspace ${ipspace}" 2>/dev/null | grep -c "${ipspace}" || true)
+        if [[ "$ipspace_check" -gt 0 ]]; then
+            log_success "  IPspace ${ipspace} already exists"
         else
-            # Step 1: IPspace
-            storage_ssh netapp-asa "ipspace create -ipspace ${ipspace}" 2>/dev/null || log_warn "  IPspace may already exist"
+            storage_ssh netapp-asa "ipspace create -ipspace ${ipspace}" 2>/dev/null || log_warn "  IPspace creation failed (may already exist)"
+            log_success "  IPspace ${ipspace} created"
+        fi
 
-            # Step 2: Broadcast domains
-            local bd_a="bd_${cloud_name}_a"
-            local bd_b="bd_${cloud_name}_b"
-            storage_ssh netapp-asa "network port broadcast-domain create -broadcast-domain ${bd_a} -mtu 9000 -ipspace ${ipspace}" 2>/dev/null || true
-            storage_ssh netapp-asa "network port broadcast-domain create -broadcast-domain ${bd_b} -mtu 9000 -ipspace ${ipspace}" 2>/dev/null || true
+        # Step 2: Broadcast domains (checked independently — no duplicate-entry noise on re-runs)
+        local bd
+        for bd in "$bd_a" "$bd_b"; do
+            local bd_check
+            bd_check=$(storage_ssh netapp-asa "network port broadcast-domain show -broadcast-domain ${bd}" 2>/dev/null | grep -c "${bd}" || true)
+            if [[ "$bd_check" -gt 0 ]]; then
+                log_success "  Broadcast domain ${bd} already exists"
+            else
+                storage_ssh netapp-asa "network port broadcast-domain create -broadcast-domain ${bd} -mtu 9000 -ipspace ${ipspace}" 2>/dev/null || log_warn "  Broadcast domain ${bd} creation failed"
+                log_success "  Broadcast domain ${bd} created"
+            fi
+        done
 
-            # Step 3: VLAN ports — path A on port_a, path B on port_b
-            local vlanA="${vlan_ids[0]}"
-            local vlanB="${vlan_ids[1]}"
-            for node in "$node1" "$node2"; do
-                storage_ssh netapp-asa "network port vlan create -node ${node} -vlan-name ${port_a}-${vlanA}" 2>/dev/null || true
-                storage_ssh netapp-asa "network port vlan create -node ${node} -vlan-name ${port_b}-${vlanB}" 2>/dev/null || true
+        # Step 3: VLAN ports + broadcast-domain membership (reconciled on every run;
+        # one port query drives create-if-missing, remove-from-wrong-domain, add-to-target)
+        local -a add_a=() add_b=()
+        local node vp cur_bd target_bd
+        for node in "$node1" "$node2"; do
+            for vp in "${port_a}-${vlanA}" "${port_b}-${vlanB}"; do
+                if [[ "$vp" == "${port_b}-${vlanB}" ]]; then
+                    target_bd="$bd_b"
+                else
+                    target_bd="$bd_a"
+                fi
+                cur_bd=$(storage_ssh netapp-asa "network port show -node ${node} -port ${vp} -fields broadcast-domain" 2>/dev/null | grep "${vp}" | awk '{print $3}' || true)
+                if [[ -z "$cur_bd" ]]; then
+                    # VLAN port doesn't exist yet — create it (auto-assigned to a Default-ipspace domain)
+                    storage_ssh netapp-asa "network port vlan create -node ${node} -vlan-name ${vp}" 2>/dev/null || log_warn "  VLAN port ${node}:${vp} creation failed"
+                    log_success "  VLAN port ${node}:${vp} created"
+                elif [[ "$cur_bd" == "$target_bd" ]]; then
+                    log_verbose "  ${node}:${vp} already in ${target_bd}"
+                    continue
+                elif [[ "$cur_bd" != "-" ]]; then
+                    log "  Moving ${node}:${vp} from ${cur_bd} to ${target_bd}"
+                    storage_ssh netapp-asa "network port broadcast-domain remove-ports -ipspace Default -broadcast-domain ${cur_bd} -ports ${node}:${vp}" 2>/dev/null || true
+                fi
+                if [[ "$target_bd" == "$bd_a" ]]; then
+                    add_a+=("${node}:${vp}")
+                else
+                    add_b+=("${node}:${vp}")
+                fi
             done
+        done
 
-            # Remove from auto-assigned Default-N domains if needed
-            for node in "$node1" "$node2"; do
-                for vp in "${port_a}-${vlanA}" "${port_b}-${vlanB}"; do
-                    local auto_bd
-                    auto_bd=$(storage_ssh netapp-asa "network port show -node ${node} -port ${vp} -fields broadcast-domain" 2>/dev/null | grep "${vp}" | awk '{print $3}' || true)
-                    if [[ -n "$auto_bd" && "$auto_bd" != "-" && "$auto_bd" != "${bd_a}" && "$auto_bd" != "${bd_b}" ]]; then
-                        log_verbose "  Removing ${node}:${vp} from auto-domain ${auto_bd}"
-                        storage_ssh netapp-asa "network port broadcast-domain remove-ports -ipspace Default -broadcast-domain ${auto_bd} -ports ${node}:${vp}" 2>/dev/null || true
-                    fi
-                done
-            done
+        if (( ${#add_a[@]} > 0 )); then
+            storage_ssh netapp-asa "network port broadcast-domain add-ports -ipspace ${ipspace} -broadcast-domain ${bd_a} -ports $(IFS=,; echo "${add_a[*]}")" 2>/dev/null || log_warn "  Failed to add ports to ${bd_a}"
+            log_success "  Ports added to ${bd_a}"
+        else
+            log_success "  Path-A ports already homed in ${bd_a}"
+        fi
+        if (( ${#add_b[@]} > 0 )); then
+            storage_ssh netapp-asa "network port broadcast-domain add-ports -ipspace ${ipspace} -broadcast-domain ${bd_b} -ports $(IFS=,; echo "${add_b[*]}")" 2>/dev/null || log_warn "  Failed to add ports to ${bd_b}"
+            log_success "  Ports added to ${bd_b}"
+        else
+            log_success "  Path-B ports already homed in ${bd_b}"
+        fi
 
-            storage_ssh netapp-asa "network port broadcast-domain add-ports -ipspace ${ipspace} -broadcast-domain ${bd_a} -ports ${node1}:${port_a}-${vlanA},${node2}:${port_a}-${vlanA}" 2>/dev/null || true
-            storage_ssh netapp-asa "network port broadcast-domain add-ports -ipspace ${ipspace} -broadcast-domain ${bd_b} -ports ${node1}:${port_b}-${vlanB},${node2}:${port_b}-${vlanB}" 2>/dev/null || true
+        # Step 4: SVM (checked independently)
+        local svm_exists
+        svm_exists=$(storage_ssh netapp-asa "vserver show -vserver ${svm} -fields vserver" 2>/dev/null | grep -c "${svm}" || true)
+        if [[ "$svm_exists" -gt 0 ]]; then
+            log_success "  SVM ${svm} already exists"
+        else
+            storage_ssh netapp-asa "vserver create -vserver ${svm} -ipspace ${ipspace} -rootvolume ${svm}_root -rootvolume-security-style unix" 2>/dev/null || log_warn "  SVM creation failed"
+            log_success "  SVM ${svm} created"
+        fi
 
-            # Step 4: SVM
-            storage_ssh netapp-asa "vserver create -vserver ${svm} -ipspace ${ipspace} -rootvolume ${svm}_root -rootvolume-security-style unix" 2>/dev/null || true
+        # (No `vserver iscsi create` step: ASA r2 enables the iSCSI service
+        #  implicitly — that step is standard-ONTAP/AFF only.)
 
-            # Step 5: LIFs (4 total: 2 nodes × 2 paths)
-            local subA="${subnet_bases[0]}"
-            local subB="${subnet_bases[1]}"
+        # Step 5: LIFs (checked by count, not just displayed)
+        local lif_count
+        lif_count=$(storage_ssh netapp-asa "network interface show -vserver ${svm} -fields address" 2>/dev/null | grep -c "iscsi_${cloud_name}" || true)
+        if [[ "$lif_count" -ge 4 ]]; then
+            log_success "  All 4 LIFs already exist"
+            local lif_output
+            lif_output=$(storage_ssh netapp-asa "network interface show -vserver ${svm} -fields address,status-oper" 2>/dev/null) || true
+            log "  LIF status:"
+            echo "$lif_output" | grep -E "iscsi|${cloud_name}" | while IFS= read -r line; do
+                log "    $line"
+            done || true
+        else
+            log "  Creating LIFs (found ${lif_count}/4)..."
             storage_ssh netapp-asa "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node1}_a -data-protocol iscsi -home-node ${node1} -home-port ${port_a}-${vlanA} -address ${subA}.2 -netmask 255.255.255.0 -status-admin up" 2>/dev/null || true
             storage_ssh netapp-asa "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node2}_a -data-protocol iscsi -home-node ${node2} -home-port ${port_a}-${vlanA} -address ${subA}.3 -netmask 255.255.255.0 -status-admin up" 2>/dev/null || true
             storage_ssh netapp-asa "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node1}_b -data-protocol iscsi -home-node ${node1} -home-port ${port_b}-${vlanB} -address ${subB}.2 -netmask 255.255.255.0 -status-admin up" 2>/dev/null || true
             storage_ssh netapp-asa "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node2}_b -data-protocol iscsi -home-node ${node2} -home-port ${port_b}-${vlanB} -address ${subB}.3 -netmask 255.255.255.0 -status-admin up" 2>/dev/null || true
-
-            log_success "  IPspace, SVM, and LIFs created"
+            log_success "  LIF creation commands issued"
         fi
     fi
 
@@ -1672,9 +1742,9 @@ storage_setup_ibm() {
         log_success "  Portset ${portset_name} already exists"
     else
         if [[ "$DRY_RUN" == "true" ]]; then
-            log "[DRY-RUN] Would create portset: svctask mkportset -type host ${portset_name}"
+            log "[DRY-RUN] Would create portset: svctask mkportset -name ${portset_name} -type host"
         else
-            storage_ssh ibm "svctask mkportset -type host ${portset_name}" 2>/dev/null || {
+            storage_ssh ibm "svctask mkportset -name ${portset_name} -type host" 2>/dev/null || {
                 log_error "  Failed to create portset ${portset_name}"
                 return 1
             }
@@ -1712,9 +1782,9 @@ storage_setup_ibm() {
             log_success "  IP ${ip} already configured on ${node}:port${port}"
         else
             if [[ "$DRY_RUN" == "true" ]]; then
-                log "[DRY-RUN] Would create: svctask mkip -node ${node} -port ${port} -ip ${ip} -mask 255.255.255.0 -vlan ${vlan}"
+                log "[DRY-RUN] Would create: svctask mkip -node ${node} -port ${port} -ip ${ip} -prefix 24 -portset ${portset_name} -vlan ${vlan}"
             else
-                storage_ssh ibm "svctask mkip -node ${node} -port ${port} -ip ${ip} -mask 255.255.255.0 -vlan ${vlan}" 2>/dev/null || {
+                storage_ssh ibm "svctask mkip -node ${node} -port ${port} -ip ${ip} -prefix 24 -portset ${portset_name} -vlan ${vlan}" 2>/dev/null || {
                     log_error "  Failed to create IP ${ip} on ${node}:port${port}"
                     continue
                 }
@@ -1775,6 +1845,15 @@ storage_setup_ibm() {
         host_check=$(storage_ssh ibm "svcinfo lshost ${host_name}" 2>/dev/null | grep -c "${host_name}" || true)
         if [[ "$host_check" -gt 0 ]]; then
             log_success "  Host ${host_name} already exists"
+            # Ensure host is in the correct portset (may differ if created by a prior run)
+            if [[ "$DRY_RUN" != "true" ]]; then
+                local cur_portset
+                cur_portset=$(storage_ssh ibm "svcinfo lshost ${host_name}" 2>/dev/null | awk '/^portset_name /{print $2}')
+                if [[ "$cur_portset" != "${portset_name}" ]]; then
+                    storage_ssh ibm "svctask chhost -portset ${portset_name} ${host_name}" 2>/dev/null || true
+                    log "    Moved ${host_name} from portset '${cur_portset}' → '${portset_name}'"
+                fi
+            fi
         else
             if [[ "$DRY_RUN" == "true" ]]; then
                 log "[DRY-RUN] Would create: svctask mkhost -name ${host_name} -iscsiname ${iqn} -iogrp io_grp0 -type generic -portset ${portset_name}"
@@ -1805,9 +1884,9 @@ storage_setup_ibm() {
                 log_success "  vdisk ${vdisk_name} already mapped to ${host_name}"
             else
                 if [[ "$DRY_RUN" == "true" ]]; then
-                    log "[DRY-RUN] Would map: svctask mkvdiskhostmap -host ${host_name} -scsi ${scsi_id} ${vdisk_name}"
+                    log "[DRY-RUN] Would map: svctask mkvdiskhostmap -host ${host_name} -force -scsi ${scsi_id} ${vdisk_name}"
                 else
-                    storage_ssh ibm "svctask mkvdiskhostmap -host ${host_name} -scsi ${scsi_id} ${vdisk_name}" 2>/dev/null || {
+                    storage_ssh ibm "svctask mkvdiskhostmap -host ${host_name} -force -scsi ${scsi_id} ${vdisk_name}" 2>/dev/null || {
                         log_error "  Failed to map ${vdisk_name} to ${host_name}"
                         continue
                     }
@@ -1831,7 +1910,7 @@ storage_setup_ibm() {
 # =============================================================================
 # STORAGE-SETUP: NetApp AFF A300
 # =============================================================================
-storage_setup_netapp_a300() {
+storage_setup_netapp_aff() {
     local cloud_name="$1"
     local cloud_nn="$2"
     shift 2
@@ -1843,92 +1922,145 @@ storage_setup_netapp_a300() {
     local svm="svm_${cloud_name}"
     local ipspace="ipspace_${cloud_name}"
 
-    # Derive VLAN layout for netapp-a300
+    # Derive VLAN layout for netapp-aff
     local -a vlan_ids=() subnet_bases=() paths=()
     while read -r _nic vlan_id subnet_base _vendor path; do
-        [[ "$_vendor" == "netapp-a300" ]] || continue
+        [[ "$_vendor" == "netapp-aff" ]] || continue
         vlan_ids+=("$vlan_id")
         subnet_bases+=("$subnet_base")
         paths+=("$path")
     done < <(compute_vlan_layout)
 
     if (( ${#vlan_ids[@]} == 0 )); then
-        log_warn "  No netapp-a300 entries in VLAN layout. Skipping."
+        log_warn "  No netapp-aff entries in VLAN layout. Skipping."
         return 0
     fi
 
     # Nodes on the A300
     local node1="b02-h37-ntap-a300-01"
     local node2="b02-h37-ntap-a300-02"
-    # Data ports — need to confirm from the array; use e0e/e0f as likely candidates
-    local port_a="e0e"
-    local port_b="e0f"
+    # Data ports — e0g and e0h are the 10GbE data ports on this A300
+    local port_a="e0g"
+    local port_b="e0h"
 
     # --- Sub-stage A: verify or create IPspace, SVM, LIFs ---
-    log "  [A] Checking IPspace and SVM..."
-    local svm_exists
-    svm_exists=$(storage_ssh netapp-a300 "vserver show -vserver ${svm} -fields vserver" 2>/dev/null | grep -c "${svm}" || true)
+    log "  [A] Checking IPspace, SVM, iSCSI service, and LIFs..."
 
-    if [[ "$svm_exists" -gt 0 ]]; then
-        log_success "  SVM ${svm} already exists"
-        local lif_output
-        lif_output=$(storage_ssh netapp-a300 "network interface show -vserver ${svm} -fields address,status-oper" 2>/dev/null) || true
-        log "  LIF status:"
-        echo "$lif_output" | grep -E "iscsi|${cloud_name}" | while IFS= read -r line; do
-            log "    $line"
-        done
+    local vlanA="${vlan_ids[0]}"
+    local vlanB="${vlan_ids[1]}"
+    local subA="${subnet_bases[0]}"
+    local subB="${subnet_bases[1]}"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log "[DRY-RUN] Would ensure: ipspace ${ipspace}, broadcast domains, VLAN ports, SVM ${svm}, iSCSI service, 4 LIFs"
     else
-        log "  Creating IPspace, broadcast domains, VLAN ports, SVM, iSCSI service, and LIFs..."
-
-        if [[ "$DRY_RUN" == "true" ]]; then
-            log "[DRY-RUN] Would create: ipspace ${ipspace}, broadcast domains, VLAN ports, SVM ${svm}, iSCSI service, 4 LIFs"
+        # Step 1: IPspace
+        local ipspace_check
+        ipspace_check=$(storage_ssh netapp-aff "ipspace show -ipspace ${ipspace}" 2>/dev/null | grep -c "${ipspace}" || true)
+        if [[ "$ipspace_check" -gt 0 ]]; then
+            log_success "  IPspace ${ipspace} already exists"
         else
-            # Step 1: IPspace
-            storage_ssh netapp-a300 "ipspace create -ipspace ${ipspace}" 2>/dev/null || log_warn "  IPspace may already exist"
+            storage_ssh netapp-aff "ipspace create -ipspace ${ipspace}" 2>/dev/null || log_warn "  IPspace creation failed (may already exist)"
+            log_success "  IPspace ${ipspace} created"
+        fi
 
-            # Step 2: Broadcast domains
-            local bd_a="bd_${cloud_name}_a"
-            local bd_b="bd_${cloud_name}_b"
-            storage_ssh netapp-a300 "network port broadcast-domain create -broadcast-domain ${bd_a} -mtu 9000 -ipspace ${ipspace}" 2>/dev/null || true
-            storage_ssh netapp-a300 "network port broadcast-domain create -broadcast-domain ${bd_b} -mtu 9000 -ipspace ${ipspace}" 2>/dev/null || true
+        # Step 2: Broadcast domains (checked independently — no duplicate-entry noise on re-runs)
+        local bd_a="bd_${cloud_name}_a"
+        local bd_b="bd_${cloud_name}_b"
+        local bd
+        for bd in "$bd_a" "$bd_b"; do
+            local bd_check
+            bd_check=$(storage_ssh netapp-aff "network port broadcast-domain show -broadcast-domain ${bd}" 2>/dev/null | grep -c "${bd}" || true)
+            if [[ "$bd_check" -gt 0 ]]; then
+                log_success "  Broadcast domain ${bd} already exists"
+            else
+                storage_ssh netapp-aff "network port broadcast-domain create -broadcast-domain ${bd} -mtu 9000 -ipspace ${ipspace}" 2>/dev/null || log_warn "  Broadcast domain ${bd} creation failed"
+                log_success "  Broadcast domain ${bd} created"
+            fi
+        done
 
-            # Step 3: VLAN ports
-            local vlanA="${vlan_ids[0]}"
-            local vlanB="${vlan_ids[1]}"
-            for node in "$node1" "$node2"; do
-                storage_ssh netapp-a300 "network port vlan create -node ${node} -vlan-name ${port_a}-${vlanA}" 2>/dev/null || true
-                storage_ssh netapp-a300 "network port vlan create -node ${node} -vlan-name ${port_b}-${vlanB}" 2>/dev/null || true
+        # Step 3: VLAN ports + broadcast-domain membership (reconciled on every run;
+        # one port query drives create-if-missing, remove-from-wrong-domain, add-to-target)
+        local -a add_a=() add_b=()
+        local node vp cur_bd target_bd
+        for node in "$node1" "$node2"; do
+            for vp in "${port_a}-${vlanA}" "${port_b}-${vlanB}"; do
+                if [[ "$vp" == "${port_b}-${vlanB}" ]]; then
+                    target_bd="$bd_b"
+                else
+                    target_bd="$bd_a"
+                fi
+                cur_bd=$(storage_ssh netapp-aff "network port show -node ${node} -port ${vp} -fields broadcast-domain" 2>/dev/null | grep "${vp}" | awk '{print $3}' || true)
+                if [[ -z "$cur_bd" ]]; then
+                    # VLAN port doesn't exist yet — create it (auto-assigned to a Default-ipspace domain)
+                    storage_ssh netapp-aff "network port vlan create -node ${node} -vlan-name ${vp}" 2>/dev/null || log_warn "  VLAN port ${node}:${vp} creation failed"
+                    log_success "  VLAN port ${node}:${vp} created"
+                elif [[ "$cur_bd" == "$target_bd" ]]; then
+                    log_verbose "  ${node}:${vp} already in ${target_bd}"
+                    continue
+                elif [[ "$cur_bd" != "-" ]]; then
+                    log "  Moving ${node}:${vp} from ${cur_bd} to ${target_bd}"
+                    storage_ssh netapp-aff "network port broadcast-domain remove-ports -ipspace Default -broadcast-domain ${cur_bd} -ports ${node}:${vp}" 2>/dev/null || true
+                fi
+                if [[ "$target_bd" == "$bd_a" ]]; then
+                    add_a+=("${node}:${vp}")
+                else
+                    add_b+=("${node}:${vp}")
+                fi
             done
+        done
 
-            # Handle auto-assigned domains
-            for node in "$node1" "$node2"; do
-                for vp in "${port_a}-${vlanA}" "${port_b}-${vlanB}"; do
-                    local auto_bd
-                    auto_bd=$(storage_ssh netapp-a300 "network port show -node ${node} -port ${vp} -fields broadcast-domain" 2>/dev/null | grep "${vp}" | awk '{print $3}' || true)
-                    if [[ -n "$auto_bd" && "$auto_bd" != "-" && "$auto_bd" != "${bd_a}" && "$auto_bd" != "${bd_b}" ]]; then
-                        storage_ssh netapp-a300 "network port broadcast-domain remove-ports -ipspace Default -broadcast-domain ${auto_bd} -ports ${node}:${vp}" 2>/dev/null || true
-                    fi
-                done
-            done
+        if (( ${#add_a[@]} > 0 )); then
+            storage_ssh netapp-aff "network port broadcast-domain add-ports -ipspace ${ipspace} -broadcast-domain ${bd_a} -ports $(IFS=,; echo "${add_a[*]}")" 2>/dev/null || log_warn "  Failed to add ports to ${bd_a}"
+            log_success "  Ports added to ${bd_a}"
+        else
+            log_success "  Path-A ports already homed in ${bd_a}"
+        fi
+        if (( ${#add_b[@]} > 0 )); then
+            storage_ssh netapp-aff "network port broadcast-domain add-ports -ipspace ${ipspace} -broadcast-domain ${bd_b} -ports $(IFS=,; echo "${add_b[*]}")" 2>/dev/null || log_warn "  Failed to add ports to ${bd_b}"
+            log_success "  Ports added to ${bd_b}"
+        else
+            log_success "  Path-B ports already homed in ${bd_b}"
+        fi
 
-            storage_ssh netapp-a300 "network port broadcast-domain add-ports -ipspace ${ipspace} -broadcast-domain ${bd_a} -ports ${node1}:${port_a}-${vlanA},${node2}:${port_a}-${vlanA}" 2>/dev/null || true
-            storage_ssh netapp-a300 "network port broadcast-domain add-ports -ipspace ${ipspace} -broadcast-domain ${bd_b} -ports ${node1}:${port_b}-${vlanB},${node2}:${port_b}-${vlanB}" 2>/dev/null || true
+        # Step 4: SVM
+        local svm_exists
+        svm_exists=$(storage_ssh netapp-aff "vserver show -vserver ${svm} -fields vserver" 2>/dev/null | grep -c "${svm}" || true)
+        if [[ "$svm_exists" -gt 0 ]]; then
+            log_success "  SVM ${svm} already exists"
+        else
+            storage_ssh netapp-aff "vserver create -vserver ${svm} -ipspace ${ipspace} -rootvolume ${svm}_root -rootvolume-security-style unix" 2>/dev/null || true
+            log_success "  SVM ${svm} created"
+        fi
 
-            # Step 4: SVM (standard ONTAP — rootvolume-security-style needed)
-            storage_ssh netapp-a300 "vserver create -vserver ${svm} -ipspace ${ipspace} -rootvolume ${svm}_root -rootvolume-security-style unix" 2>/dev/null || true
+        # Step 5: iSCSI service (check independently — may be missing even if SVM exists)
+        local iscsi_check
+        iscsi_check=$(storage_ssh netapp-aff "vserver iscsi show -vserver ${svm}" 2>/dev/null | grep -c "${svm}" || true)
+        if [[ "$iscsi_check" -gt 0 ]]; then
+            log_success "  iSCSI service already enabled on ${svm}"
+        else
+            storage_ssh netapp-aff "vserver iscsi create -vserver ${svm}" 2>/dev/null || log_warn "  iSCSI service creation failed"
+            log "  iSCSI service enabled on ${svm}"
+        fi
 
-            # Step 4b: Enable iSCSI on the SVM (needed on standard ONTAP, unlike ASA r2)
-            storage_ssh netapp-a300 "vserver iscsi create -vserver ${svm}" 2>/dev/null || true
-
-            # Step 5: LIFs
-            local subA="${subnet_bases[0]}"
-            local subB="${subnet_bases[1]}"
-            storage_ssh netapp-a300 "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node1}_a -data-protocol iscsi -home-node ${node1} -home-port ${port_a}-${vlanA} -address ${subA}.2 -netmask 255.255.255.0 -status-admin up" 2>/dev/null || true
-            storage_ssh netapp-a300 "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node2}_a -data-protocol iscsi -home-node ${node2} -home-port ${port_a}-${vlanA} -address ${subA}.3 -netmask 255.255.255.0 -status-admin up" 2>/dev/null || true
-            storage_ssh netapp-a300 "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node1}_b -data-protocol iscsi -home-node ${node1} -home-port ${port_b}-${vlanB} -address ${subB}.2 -netmask 255.255.255.0 -status-admin up" 2>/dev/null || true
-            storage_ssh netapp-a300 "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node2}_b -data-protocol iscsi -home-node ${node2} -home-port ${port_b}-${vlanB} -address ${subB}.3 -netmask 255.255.255.0 -status-admin up" 2>/dev/null || true
-
-            log_success "  IPspace, SVM, iSCSI service, and LIFs created"
+        # Step 6: LIFs (check each independently)
+        local lif_count
+        lif_count=$(storage_ssh netapp-aff "network interface show -vserver ${svm} -fields address" 2>/dev/null | grep -c "iscsi_${cloud_name}" || true)
+        if [[ "$lif_count" -ge 4 ]]; then
+            log_success "  All 4 LIFs already exist"
+            local lif_output
+            lif_output=$(storage_ssh netapp-aff "network interface show -vserver ${svm} -fields address,status-oper" 2>/dev/null) || true
+            log "  LIF status:"
+            echo "$lif_output" | grep -E "iscsi|${cloud_name}" | while IFS= read -r line; do
+                log "    $line"
+            done || true
+        else
+            log "  Creating LIFs (found ${lif_count}/4)..."
+            storage_ssh netapp-aff "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node1}_a -data-protocol iscsi -home-node ${node1} -home-port ${port_a}-${vlanA} -address ${subA}.2 -netmask 255.255.255.0 -status-admin up" 2>/dev/null || true
+            storage_ssh netapp-aff "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node2}_a -data-protocol iscsi -home-node ${node2} -home-port ${port_a}-${vlanA} -address ${subA}.3 -netmask 255.255.255.0 -status-admin up" 2>/dev/null || true
+            storage_ssh netapp-aff "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node1}_b -data-protocol iscsi -home-node ${node1} -home-port ${port_b}-${vlanB} -address ${subB}.2 -netmask 255.255.255.0 -status-admin up" 2>/dev/null || true
+            storage_ssh netapp-aff "network interface create -vserver ${svm} -lif iscsi_${cloud_name}_${node2}_b -data-protocol iscsi -home-node ${node2} -home-port ${port_b}-${vlanB} -address ${subB}.3 -netmask 255.255.255.0 -status-admin up" 2>/dev/null || true
+            log_success "  LIF creation commands issued"
         fi
     fi
 
@@ -1941,14 +2073,18 @@ storage_setup_netapp_a300() {
         lun_name=$(printf "${cloud_name}_lta_ntapaff_lun%02d" "$i")
 
         local vol_check
-        vol_check=$(storage_ssh netapp-a300 "volume show -vserver ${svm} -volume ${vol_name} -fields volume" 2>/dev/null | grep -c "${vol_name}" || true)
+        vol_check=$(storage_ssh netapp-aff "volume show -vserver ${svm} -volume ${vol_name} -fields volume" 2>/dev/null | grep -c "${vol_name}" || true)
         if [[ "$vol_check" -gt 0 ]]; then
             log_success "  Volume ${vol_name} already exists"
+            # Ensure snapshot reserve is 0 for LUN volumes (may have been created with default 5%)
+            if [[ "$DRY_RUN" != "true" ]]; then
+                storage_ssh netapp-aff "volume modify -vserver ${svm} -volume ${vol_name} -percent-snapshot-space 0" 2>/dev/null || true
+            fi
         else
             if [[ "$DRY_RUN" == "true" ]]; then
-                log "[DRY-RUN] Would create volume: volume create -vserver ${svm} -volume ${vol_name} -aggregate eng_data_aggr01 -size ${LUN_SIZE} -space-guarantee none"
+                log "[DRY-RUN] Would create volume: volume create -vserver ${svm} -volume ${vol_name} -aggregate eng_data_aggr01 -size ${LUN_SIZE} -space-guarantee none -percent-snapshot-space 0"
             else
-                storage_ssh netapp-a300 "volume create -vserver ${svm} -volume ${vol_name} -aggregate eng_data_aggr01 -size ${LUN_SIZE} -space-guarantee none" 2>/dev/null || {
+                storage_ssh netapp-aff "volume create -vserver ${svm} -volume ${vol_name} -aggregate eng_data_aggr01 -size ${LUN_SIZE} -space-guarantee none -percent-snapshot-space 0" 2>/dev/null || {
                     log_error "  Failed to create volume ${vol_name}"
                     continue
                 }
@@ -1957,14 +2093,14 @@ storage_setup_netapp_a300() {
         fi
 
         local lun_check
-        lun_check=$(storage_ssh netapp-a300 "lun show -vserver ${svm} -volume ${vol_name} -lun ${lun_name} -fields lun" 2>/dev/null | grep -c "${lun_name}" || true)
+        lun_check=$(storage_ssh netapp-aff "lun show -vserver ${svm} -volume ${vol_name} -lun ${lun_name} -fields lun" 2>/dev/null | grep -c "${lun_name}" || true)
         if [[ "$lun_check" -gt 0 ]]; then
             log_success "  LUN ${lun_name} already exists"
         else
             if [[ "$DRY_RUN" == "true" ]]; then
-                log "[DRY-RUN] Would create LUN: lun create -vserver ${svm} -volume ${vol_name} -lun ${lun_name} -size ${LUN_SIZE} -ostype linux"
+                log "[DRY-RUN] Would create LUN: lun create -vserver ${svm} -volume ${vol_name} -lun ${lun_name} -size ${LUN_SIZE} -ostype linux -space-reserve disabled"
             else
-                storage_ssh netapp-a300 "lun create -vserver ${svm} -volume ${vol_name} -lun ${lun_name} -size ${LUN_SIZE} -ostype linux" 2>/dev/null || {
+                storage_ssh netapp-aff "lun create -vserver ${svm} -volume ${vol_name} -lun ${lun_name} -size ${LUN_SIZE} -ostype linux -space-reserve disabled" 2>/dev/null || {
                     log_error "  Failed to create LUN ${lun_name}"
                     continue
                 }
@@ -1977,7 +2113,7 @@ storage_setup_netapp_a300() {
     log "  [C] Creating igroup..."
     local ig_name="${cloud_name}_iscsi_ig"
     local ig_check
-    ig_check=$(storage_ssh netapp-a300 "lun igroup show -vserver ${svm} -igroup ${ig_name}" 2>/dev/null | grep -c "${ig_name}" || true)
+    ig_check=$(storage_ssh netapp-aff "lun igroup show -vserver ${svm} -igroup ${ig_name}" 2>/dev/null | grep -c "${ig_name}" || true)
 
     local iqn_list=""
     for pair in "${iqn_pairs[@]}"; do
@@ -1991,9 +2127,9 @@ storage_setup_netapp_a300() {
         for pair in "${iqn_pairs[@]}"; do
             local iqn="${pair#*:}"
             local already
-            already=$(storage_ssh netapp-a300 "lun igroup show -vserver ${svm} -igroup ${ig_name} -fields initiator" 2>/dev/null | grep -c "$iqn" || true)
+            already=$(storage_ssh netapp-aff "lun igroup show -vserver ${svm} -igroup ${ig_name} -fields initiator" 2>/dev/null | grep -c "$iqn" || true)
             if [[ "$already" -eq 0 && "$DRY_RUN" != "true" ]]; then
-                storage_ssh netapp-a300 "lun igroup add -vserver ${svm} -igroup ${ig_name} -initiator ${iqn}" 2>/dev/null || true
+                storage_ssh netapp-aff "lun igroup add -vserver ${svm} -igroup ${ig_name} -initiator ${iqn}" 2>/dev/null || true
                 log "  Added initiator ${iqn} to ${ig_name}"
             fi
         done
@@ -2001,7 +2137,7 @@ storage_setup_netapp_a300() {
         if [[ "$DRY_RUN" == "true" ]]; then
             log "[DRY-RUN] Would create igroup ${ig_name} with initiators: ${iqn_list}"
         elif [[ -n "$iqn_list" ]]; then
-            storage_ssh netapp-a300 "lun igroup create -vserver ${svm} -igroup ${ig_name} -protocol iscsi -ostype linux -initiator ${iqn_list}" 2>/dev/null || {
+            storage_ssh netapp-aff "lun igroup create -vserver ${svm} -igroup ${ig_name} -protocol iscsi -ostype linux -initiator ${iqn_list}" 2>/dev/null || {
                 log_error "  Failed to create igroup ${ig_name}"
                 return 1
             }
@@ -2021,14 +2157,14 @@ storage_setup_netapp_a300() {
         local lun_id=$(( i - 1 ))
 
         local map_check
-        map_check=$(storage_ssh netapp-a300 "lun mapping show -vserver ${svm} -path ${lun_path} -fields igroup" 2>/dev/null | grep -c "${ig_name}" || true)
+        map_check=$(storage_ssh netapp-aff "lun mapping show -vserver ${svm} -path ${lun_path} -fields igroup" 2>/dev/null | grep -c "${ig_name}" || true)
         if [[ "$map_check" -gt 0 ]]; then
             log_success "  LUN ${lun_path} already mapped to ${ig_name}"
         else
             if [[ "$DRY_RUN" == "true" ]]; then
                 log "[DRY-RUN] Would map: lun mapping create -vserver ${svm} -path ${lun_path} -igroup ${ig_name} -lun-id ${lun_id}"
             else
-                storage_ssh netapp-a300 "lun mapping create -vserver ${svm} -path ${lun_path} -igroup ${ig_name} -lun-id ${lun_id}" 2>/dev/null || {
+                storage_ssh netapp-aff "lun mapping create -vserver ${svm} -path ${lun_path} -igroup ${ig_name} -lun-id ${lun_id}" 2>/dev/null || {
                     log_error "  Failed to map LUN ${lun_path}"
                     continue
                 }
@@ -2051,15 +2187,19 @@ storage_discovery_and_verify() {
     log ""
     log "--- Sub-stage E: iSCSI discovery + login + verification ---"
 
-    # Collect portal IPs per vendor (the .2 address from each VLAN)
+    # Collect portal IPs per vendor (.2 and .3 for dual-controller arrays like IBM)
     declare -A vendor_portals
     while read -r _nic vlan_id subnet_base vendor path; do
-        local portal_ip="${subnet_base}.2"
-        if [[ -n "${vendor_portals[$vendor]:-}" ]]; then
-            vendor_portals[$vendor]+=" ${portal_ip}"
-        else
-            vendor_portals[$vendor]="$portal_ip"
-        fi
+        for last_octet in 2 3; do
+            local portal_ip="${subnet_base}.${last_octet}"
+            if [[ -n "${vendor_portals[$vendor]:-}" ]]; then
+                # Avoid duplicates (same IP from different layout entries)
+                [[ " ${vendor_portals[$vendor]} " == *" ${portal_ip} "* ]] && continue
+                vendor_portals[$vendor]+=" ${portal_ip}"
+            else
+                vendor_portals[$vendor]="$portal_ip"
+            fi
+        done
     done < <(compute_vlan_layout)
 
     # Get OCP worker list
@@ -2150,7 +2290,7 @@ storage_discovery_and_verify() {
                 ibm)        vendor_pattern="IBM,2145" ;;
                 pure)       vendor_pattern="PURE,FlashArray" ;;
                 netapp-asa) vendor_pattern="NETAPP,LUN" ;;
-                netapp-a300) vendor_pattern="NETAPP,LUN" ;;
+                netapp-aff) vendor_pattern="NETAPP,LUN" ;;
             esac
 
             local path_count
@@ -2182,11 +2322,8 @@ do_storage_setup() {
 
     # Pre-populate bws credential cache so $() subshells inherit it
     if [[ "$DRY_RUN" != "true" ]]; then
-        _BWS_CACHE=$(bws secret list -o json 2>/dev/null) || {
-            log_error "bws secret list failed. Ensure BWS_ACCESS_TOKEN is set."
-            return 1
-        }
-        log "Credential cache loaded (${#_BWS_CACHE} bytes)"
+        bws_load_cache || return 1
+        log "Credential cache loaded (${#_BWS_CACHE} bytes, storage credentials only)"
     fi
 
     local cloud_name="cloud$(printf '%02d' "$CLOUD_ID")"
@@ -2216,7 +2353,7 @@ do_storage_setup() {
             netapp-asa)  storage_setup_netapp_asa  "$cloud_name" "$cloud_nn" "${iqn_pairs[@]}" ;;
             pure)        storage_setup_pure         "$cloud_name" "$cloud_nn" "${iqn_pairs[@]}" ;;
             ibm)         storage_setup_ibm          "$cloud_name" "$cloud_nn" "${iqn_pairs[@]}" ;;
-            netapp-a300) storage_setup_netapp_a300  "$cloud_name" "$cloud_nn" "${iqn_pairs[@]}" ;;
+            netapp-aff) storage_setup_netapp_aff  "$cloud_name" "$cloud_nn" "${iqn_pairs[@]}" ;;
             *)           log_warn "Unknown vendor '${vendor}' — skipping storage-setup" ;;
         esac
     done

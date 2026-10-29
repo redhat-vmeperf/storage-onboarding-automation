@@ -13,7 +13,7 @@ When a new cloud is allocated in the ScaleLab, its worker nodes need VLAN sub-in
 | `netapp-asa` | NetApp ASA A70 | SSH (ONTAP CLI, flat LUN namespace) |
 | `pure` | Pure FlashArray X70R5 | SSH (Purity CLI) |
 | `ibm` | IBM FlashSystem 7300 | SSH (SVC CLI — `svctask`/`svcinfo`) |
-| `netapp-a300` | NetApp AFF A300 | SSH (standard ONTAP CLI with volumes) |
+| `netapp-aff` | NetApp AFF A300 | SSH (standard ONTAP CLI with volumes) |
 
 ## Quick Start
 
@@ -110,7 +110,7 @@ Secret keys used:
 | `STORAGE_NETAPP_AFF_MGMT_IP` / `_USER` / `_MGMT_PW` | NetApp A300 SSH access |
 | `STORAGE_PURE_MGMT_IP` / `_USER` / `_PW` | Pure FlashArray SSH access |
 
-Credentials are cached in-memory for the duration of a single run (one `bws secret list` call) and are never written to disk.
+Credentials are cached in-memory for the duration of a single run (one `bws secret list` call, filtered to `STORAGE_*` keys — non-storage secrets in the BWS project are never retained) and are never written to disk. Optionally set `BWS_PROJECT_ID` to scope the list call to a dedicated storage-credentials project.
 
 ## Prerequisites
 
