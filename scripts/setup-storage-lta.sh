@@ -7,7 +7,7 @@
 #   collect    — query QUADS API, extract host/interface/MAC data
 #   verify     — check that target interfaces aren't already in use
 #   jira-draft — generate a VLAN-change Jira request (SCALELAB project)
-#   host-setup — create VLAN sub-interfaces, configure iSCSI + multipath
+#   host-setup — VLAN sub-interfaces, iSCSI, and multipath (MachineConfig on OCP)
 #   check      — verify connectivity to storage portal IPs
 #
 # Design principles:
@@ -42,6 +42,9 @@ CLOUD99_OUTER_VLAN="2080"
 # Volume / LUN configuration for storage-setup stage
 LUN_SIZE="1TB"
 LUN_COUNT=1
+
+# Seconds to wait for mcp/worker after applying the multipath MachineConfig.
+MCP_WAIT_TIMEOUT=3600
 
 # Script options
 DRY_RUN=false
@@ -86,59 +89,12 @@ IFACE_OS_MAP=(
 )
 
 # =============================================================================
-# Multipath device configs per vendor
+# Multipath configuration
+# One file for every vendor (files/multipath.conf): IBM and Pure device
+# blocks, NetApp on the built-in ONTAP profile. OpenShift installs it with a
+# worker MachineConfig. Bare metal and VMware write the same file over SSH.
 # =============================================================================
-MULTIPATH_IBM='devices {
-        device {
-                vendor                  "IBM"
-                product                 "2145"
-                path_grouping_policy    "group_by_prio"
-                prio                    "alua"
-                path_checker            "tur"
-                path_selector           "service-time 0"
-                failback                "immediate"
-                no_path_retry           "queue"
-                rr_weight               "uniform"
-                rr_min_io_rq            1
-                fast_io_fail_tmo        5
-                dev_loss_tmo            infinity
-        }
-}'
-
-MULTIPATH_PURE='devices {
-        device {
-                vendor                  "PURE"
-                product                 "FlashArray"
-                path_grouping_policy    "group_by_prio"
-                prio                    "alua"
-                path_checker            "tur"
-                path_selector           "service-time 0"
-                failback                "immediate"
-                no_path_retry           1
-                rr_weight               "uniform"
-                rr_min_io_rq            1
-                fast_io_fail_tmo        10
-                dev_loss_tmo            60
-        }
-}'
-
-MULTIPATH_NETAPP='devices {
-        device {
-                vendor                  "NETAPP"
-                product                 "LUN"
-                path_grouping_policy    "group_by_prio"
-                prio                    "ontap"
-                path_checker            "tur"
-                path_selector           "service-time 0"
-                failback                "immediate"
-                no_path_retry           "queue"
-                rr_weight               "uniform"
-                rr_min_io_rq            128
-                fast_io_fail_tmo        5
-                dev_loss_tmo            infinity
-                features                "3 queue_if_no_path pg_init_retries 50"
-        }
-}'
+MULTIPATH_CONF_FILE="${REPO_DIR}/files/multipath.conf"
 
 # =============================================================================
 # Logging
@@ -160,7 +116,7 @@ Stages (run one at a time, or 'all'):
   collect        Query QUADS API, output MAC CSV to results/
   verify         Check interfaces aren't already in cloud99 / active use
   jira-draft     Generate Jira VLAN change request text
-  host-setup     Create VLAN sub-interfaces + iSCSI/multipath config
+  host-setup     Create VLAN sub-interfaces + iSCSI; multipath via MachineConfig on OCP
   storage-setup  Configure storage arrays (portals, volumes, hosts, mappings)
   check          Verify connectivity to storage portal IPs
   all            Run all stages in order
@@ -170,6 +126,7 @@ Options:
   -n           Dry-run mode — show what would be done, change nothing
   -v           Verbose output
   -w HOST      Single-worker mode — run only on this host
+               (host-setup MachineConfig still applies to the whole worker pool)
   -h           Show this help
 
 The env file must set at minimum:
@@ -357,6 +314,7 @@ resolve_os_iface() {
 #
 # OCP CoreOS workers cannot be configured via SSH + nmcli.
 #   - VLAN interfaces → NNCP (NodeNetworkConfigurationPolicy) CRDs via oc apply
+#   - multipath.conf  → MachineConfig on the worker MachineConfigPool
 #   - Host commands   → oc debug node/<name> -- chroot /host <cmd>
 #
 # Bare-metal / VMware hosts use direct SSH + nmcli.
@@ -576,9 +534,10 @@ HEADER
 # STAGE: host-setup
 #
 # Two paths depending on TARGET_TYPE:
-#   ocp  → generate NNCP YAMLs for VLAN interfaces, apply via oc apply;
-#          iSCSI/multipath via oc debug
-#   bare/vmware → SSH + nmcli for VLANs, SSH for iSCSI/multipath
+#   ocp  → NNCP YAMLs for VLAN interfaces, applied via oc apply;
+#          /etc/multipath.conf via one worker MachineConfig, then wait for
+#          mcp/worker; iSCSI initiator via oc debug after the pool rolls
+#   bare/vmware → SSH + nmcli for VLANs, SSH for iSCSI and multipath.conf
 # =============================================================================
 
 # ---- OCP: Generate NNCP YAML for a single VLAN interface --------------------
@@ -801,7 +760,7 @@ for h in data:
     fi
 }
 
-# ---- OCP: iSCSI + multipath via oc debug ------------------------------------
+# ---- OCP: iSCSI initiator via oc debug ---------------------------------------
 setup_iscsi_initiator_ocp() {
     local node="$1"
     log "  Configuring iSCSI initiator on node ${node} via oc debug..."
@@ -815,50 +774,158 @@ setup_iscsi_initiator_ocp() {
     log_success "  iSCSI initiator ready on ${node}"
 }
 
-setup_multipath_vendor_ocp() {
-    local node="$1"
-    local vendor="$2"
+# ---- OCP: multipath.conf via a worker MachineConfig --------------------------
+# files/multipath.conf is one file with a single devices section. The worker
+# MachineConfigPool is what makes that file survive a reboot. Label values
+# are limited to 63 characters, so the sha256 label keeps the first 63 hex
+# digits of the file hash.
+generate_multipath_mc_yaml() {
+    local cloud_name="$1"
+    local sha_label="$2"
+    local b64="$3"
+    local mc_name="99-${cloud_name}-storage-lta-multipath"
 
-    local vendor_pattern=""
-    local config_block=""
-    case "$vendor" in
-        ibm)
-            config_block="$MULTIPATH_IBM"
-            vendor_pattern='vendor.*"IBM"'
-            ;;
-        pure)
-            config_block="$MULTIPATH_PURE"
-            vendor_pattern='vendor.*"PURE"'
-            ;;
-        netapp-asa|netapp-aff)
-            config_block="$MULTIPATH_NETAPP"
-            vendor_pattern='vendor.*"NETAPP"'
-            ;;
-        *)
-            log_warn "  No multipath config known for vendor '${vendor}'; skipping"
+    cat <<EOF
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  name: ${mc_name}
+  labels:
+    machineconfiguration.openshift.io/role: worker
+    storage-lta/cloud: "${cloud_name}"
+    storage-lta/multipath-sha256: "${sha_label}"
+spec:
+  config:
+    ignition:
+      version: 3.2.0
+    storage:
+      files:
+        - path: /etc/multipath.conf
+          mode: 0644
+          overwrite: true
+          filesystem: root
+          contents:
+            source: data:text/plain;charset=utf-8;base64,${b64}
+    systemd:
+      units:
+        - name: multipathd.service
+          enabled: true
+EOF
+}
+
+# Poll mcp/worker until the rendered config includes this MachineConfig and
+# the pool is Updated. A label-only change does not move the rendered name,
+# so an already-current pool returns on the first poll.
+wait_for_worker_mcp() {
+    local mc_name="$1"
+    local pool="$2"
+    local timeout="${MCP_WAIT_TIMEOUT:-3600}"
+    local interval=15
+    local elapsed=0
+
+    if [[ ! "$timeout" =~ ^[0-9]+$ ]]; then
+        log_error "  MCP_WAIT_TIMEOUT must be a number of seconds (got '${timeout}')"
+        return 1
+    fi
+
+    if ! oc get "mcp/${pool}" >/dev/null 2>&1; then
+        log_error "  MachineConfigPool ${pool} not found"
+        return 1
+    fi
+
+    log "  Waiting up to ${timeout}s for mcp/${pool} to roll out ${mc_name}..."
+
+    while (( elapsed < timeout )); do
+        local line
+        line=$(oc get "mcp/${pool}" -o jsonpath='{.spec.configuration.name}{"|"}{.status.configuration.name}{"|"}{.status.conditions[?(@.type=="Updated")].status}{"|"}{.status.conditions[?(@.type=="Updating")].status}{"|"}{.status.conditions[?(@.type=="Degraded")].status}{"|"}{.status.updatedMachineCount}{"|"}{.status.machineCount}{"|"}{.spec.configuration.source[*].name}' 2>/dev/null || true)
+
+        local spec_name status_name updated updating degraded updated_count machine_count sources
+        IFS='|' read -r spec_name status_name updated updating degraded updated_count machine_count sources <<< "$line"
+
+        local has_mc=false
+        if [[ " ${sources} " == *" ${mc_name} "* ]]; then
+            has_mc=true
+        fi
+
+        log "  mcp/${pool}: Updated=${updated:-unknown} Updating=${updating:-unknown} Degraded=${degraded:-unknown} (${updated_count:-?}/${machine_count:-?})"
+
+        if [[ "$has_mc" == "true" && "$degraded" == "True" ]]; then
+            log_error "  mcp/${pool} is Degraded while rolling out ${mc_name}. Check: oc describe mcp ${pool}"
+            return 1
+        fi
+
+        if [[ "$has_mc" == "true" && -n "$spec_name" && "$spec_name" == "$status_name" \
+            && "$updated" == "True" && "$updating" != "True" && "$degraded" != "True" ]]; then
+            log_success "  mcp/${pool} is updated (${updated_count}/${machine_count})"
             return 0
-            ;;
-    esac
+        fi
 
-    local check
-    check=$(run_on_host "$node" "grep -q '${vendor_pattern}' /etc/multipath.conf 2>/dev/null && echo EXISTS || echo NOT_FOUND")
-    if [[ "$DRY_RUN" == "true" ]]; then return 0; fi
+        sleep "$interval"
+        elapsed=$((elapsed + interval))
+    done
 
-    if [[ "$check" == "EXISTS" ]]; then
-        log_verbose "  Multipath config for ${vendor} already present on ${node}"
+    log_error "  mcp/${pool} did not reach Updated=True within ${timeout}s. Check: oc get mcp ${pool}"
+    return 1
+}
+
+setup_multipath_ocp() {
+    local cloud_name="cloud$(printf '%02d' "$CLOUD_ID")"
+    local mc_name="99-${cloud_name}-storage-lta-multipath"
+    local pool="worker"
+    local mc_dir="${RESULTS_DIR}/${cloud_name}-machineconfig"
+    local mc_file="${mc_dir}/${mc_name}.yaml"
+    local conf="${MULTIPATH_CONF_FILE}"
+
+    if [[ ! -f "$conf" ]]; then
+        log_error "  Multipath config not found: ${conf}"
+        return 1
+    fi
+
+    local sha sha_label b64
+    sha=$(sha256sum "$conf" | awk '{print $1}')
+    # Label values max out at 63 characters; sha256 hex is 64.
+    sha_label="${sha:0:63}"
+    b64=$(base64 -w0 "$conf")
+
+    mkdir -p "$mc_dir"
+    generate_multipath_mc_yaml "$cloud_name" "$sha_label" "$b64" > "$mc_file"
+    log "  MachineConfig written to: ${mc_file}"
+
+    if [[ -n "$SINGLE_WORKER" ]]; then
+        log_warn "  -w limits per-node iSCSI only. MachineConfig ${mc_name} applies to every node in the worker pool."
+    fi
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log "[DRY-RUN] Would apply: oc apply -f ${mc_file}"
+        log "[DRY-RUN] A new or changed MachineConfig reboots every worker in mcp/${pool}."
         return 0
     fi
 
-    log "  Adding multipath config for ${vendor} on ${node} via oc debug..."
-    run_on_host "$node" "cp /etc/multipath.conf /etc/multipath.conf.bak.\$(date +%s); \
-        cat >> /etc/multipath.conf <<'EOFMP'
-${config_block}
-EOFMP
-echo ADDED" || {
-        log_error "  Failed to update multipath.conf on ${node}"
+    if ! command -v oc &>/dev/null; then
+        log_error "  'oc' command not found. MachineConfig generated but not applied."
+        log "  Apply manually: oc apply -f ${mc_file}"
         return 1
-    }
-    log_success "  Multipath config for ${vendor} added on ${node}"
+    fi
+
+    local live_sha updated updating degraded
+    live_sha=$(oc get "mc/${mc_name}" -o "jsonpath={.metadata.labels['storage-lta/multipath-sha256']}" 2>/dev/null || true)
+    updated=$(oc get "mcp/${pool}" -o jsonpath='{.status.conditions[?(@.type=="Updated")].status}' 2>/dev/null || true)
+    updating=$(oc get "mcp/${pool}" -o jsonpath='{.status.conditions[?(@.type=="Updating")].status}' 2>/dev/null || true)
+    degraded=$(oc get "mcp/${pool}" -o jsonpath='{.status.conditions[?(@.type=="Degraded")].status}' 2>/dev/null || true)
+
+    if [[ "$live_sha" == "$sha_label" && "$updated" == "True" && "$updating" != "True" && "$degraded" != "True" ]]; then
+        log_success "  MachineConfig ${mc_name} already applied and mcp/${pool} is updated"
+        return 0
+    fi
+
+    log "  Applying MachineConfig ${mc_name} to mcp/${pool}..."
+    log "  A new or changed MachineConfig reboots every worker in the pool."
+    if ! oc apply -f "$mc_file" 2>&1; then
+        log_error "  oc apply failed. Review ${mc_file}"
+        return 1
+    fi
+
+    wait_for_worker_mcp "$mc_name" "$pool"
 }
 
 # ---- Bare-metal / VMware: VLAN interfaces via SSH + nmcli --------------------
@@ -941,50 +1008,55 @@ setup_iscsi_initiator_ssh() {
     log_success "  iSCSI initiator ready on ${worker}"
 }
 
-setup_multipath_vendor_ssh() {
+setup_multipath_ssh() {
     local worker="$1"
-    local vendor="$2"
+    local conf="${MULTIPATH_CONF_FILE}"
 
-    local config_block=""
-    local vendor_pattern=""
-    case "$vendor" in
-        ibm)
-            config_block="$MULTIPATH_IBM"
-            vendor_pattern='vendor.*"IBM"'
-            ;;
-        pure)
-            config_block="$MULTIPATH_PURE"
-            vendor_pattern='vendor.*"PURE"'
-            ;;
-        netapp-asa|netapp-aff)
-            config_block="$MULTIPATH_NETAPP"
-            vendor_pattern='vendor.*"NETAPP"'
-            ;;
-        *)
-            log_warn "  No multipath config known for vendor '${vendor}'; skipping"
-            return 0
-            ;;
-    esac
+    if [[ ! -f "$conf" ]]; then
+        log_error "  Multipath config not found: ${conf}"
+        return 1
+    fi
 
-    local check
-    check=$(run_on_host "$worker" "grep -q '${vendor_pattern}' /etc/multipath.conf 2>/dev/null && echo EXISTS || echo NOT_FOUND")
-    if [[ "$DRY_RUN" == "true" ]]; then return 0; fi
-
-    if [[ "$check" == "EXISTS" ]]; then
-        log_verbose "  Multipath config for ${vendor} already present on ${worker}"
+    log "  Installing multipath.conf on ${worker}..."
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log "[DRY-RUN] Would install ${conf} as /etc/multipath.conf on ${worker} and restart multipathd if it differs"
         return 0
     fi
 
-    log "  Adding multipath config for ${vendor} on ${worker}..."
-    run_on_host "$worker" "cp /etc/multipath.conf /etc/multipath.conf.bak.\$(date +%s); \
-        cat >> /etc/multipath.conf <<'EOFMP'
-${config_block}
-EOFMP
-echo ADDED" || {
-        log_error "  Failed to update multipath.conf on ${worker}"
+    local b64 remote result
+    b64=$(base64 -w0 "$conf")
+    remote="set -euo pipefail
+echo '${b64}' | base64 -d > /tmp/multipath.conf.storage-lta
+if [ -f /etc/multipath.conf ] && cmp -s /tmp/multipath.conf.storage-lta /etc/multipath.conf; then
+    rm -f /tmp/multipath.conf.storage-lta
+    echo SAME
+    exit 0
+fi
+if [ -f /etc/multipath.conf ]; then
+    cp -a /etc/multipath.conf /etc/multipath.conf.bak.\$(date +%s)
+fi
+cp /tmp/multipath.conf.storage-lta /etc/multipath.conf
+chmod 644 /etc/multipath.conf
+if command -v restorecon >/dev/null 2>&1; then
+    restorecon /etc/multipath.conf || true
+fi
+rm -f /tmp/multipath.conf.storage-lta
+systemctl enable --now multipathd
+systemctl restart multipathd
+echo UPDATED"
+    result=$(run_on_host "$worker" "$remote") || {
+        log_error "  Failed to install multipath.conf on ${worker}"
         return 1
     }
-    log_success "  Multipath config for ${vendor} added on ${worker}"
+
+    if [[ "$result" == *UPDATED* ]]; then
+        log_success "  multipath.conf installed and multipathd restarted on ${worker}"
+    elif [[ "$result" == *SAME* ]]; then
+        log_verbose "  multipath.conf already matches on ${worker}"
+    else
+        log_error "  Unexpected result installing multipath.conf on ${worker}: ${result}"
+        return 1
+    fi
 }
 
 # ---- Main host-setup dispatcher ----------------------------------------------
@@ -1006,26 +1078,28 @@ do_host_setup() {
     local json
     json=$(quads_query_hosts) || return 1
 
-    local -a vendors_arr
-    read -r -a vendors_arr <<< "$STORAGE_ARRAYS"
-
-    # ---- OCP path: NNCP for VLANs, oc debug for iSCSI/multipath ----
+    # ---- OCP path: NNCP for VLANs, MachineConfig for multipath, oc debug for iSCSI ----
     if [[ "$TARGET_TYPE" == "ocp" ]]; then
         log ""
         log "--- OCP mode: VLAN interfaces via NNCP ---"
         setup_vlan_interfaces_ocp "$json"
 
         log ""
-        log "--- OCP mode: iSCSI + multipath via oc debug ---"
+        log "--- OCP mode: multipath.conf via worker MachineConfig ---"
+        setup_multipath_ocp
 
-        # Get actual OCP worker node names
+        log ""
+        log "--- OCP mode: iSCSI initiator via oc debug ---"
+
+        # Get actual OCP worker node names. Run this after the pool rollout so
+        # oc debug does not race the reboot.
         local -a ocp_worker_list=()
         if command -v oc &>/dev/null; then
             mapfile -t ocp_worker_list < <(oc get nodes -l node-role.kubernetes.io/worker --no-headers -o custom-columns=NAME:.metadata.name 2>/dev/null)
         fi
 
         if (( ${#ocp_worker_list[@]} == 0 )); then
-            log_warn "  No OCP worker nodes found. Skipping iSCSI/multipath setup."
+            log_warn "  No OCP worker nodes found. Skipping iSCSI initiator setup."
         else
             for node in "${ocp_worker_list[@]}"; do
                 if [[ -n "$SINGLE_WORKER" && "$node" != *"$SINGLE_WORKER"* ]]; then
@@ -1044,14 +1118,10 @@ do_host_setup() {
 
                 setup_iscsi_initiator_ocp "$node"
 
-                for vendor in "${vendors_arr[@]}"; do
-                    setup_multipath_vendor_ocp "$node" "$vendor"
-                done
-
                 if [[ "$DRY_RUN" != "true" ]]; then
-                    log "  Restarting multipathd and iscsi services..."
-                    run_on_host "$node" "systemctl restart multipathd iscsi 2>/dev/null; systemctl enable multipathd iscsid 2>/dev/null" || true
-                    log_success "  Services restarted on ${node}"
+                    log "  Restarting iscsid on ${node}..."
+                    run_on_host "$node" "systemctl restart iscsid 2>/dev/null; systemctl enable iscsid 2>/dev/null" || true
+                    log_success "  iscsid restarted on ${node}"
                 fi
             done
         fi
@@ -1086,15 +1156,12 @@ do_host_setup() {
 
             setup_vlan_interfaces_ssh "$worker" "$model"
             setup_iscsi_initiator_ssh "$worker"
-
-            for vendor in "${vendors_arr[@]}"; do
-                setup_multipath_vendor_ssh "$worker" "$vendor"
-            done
+            setup_multipath_ssh "$worker"
 
             if [[ "$DRY_RUN" != "true" ]]; then
-                log "  Restarting multipathd and iscsi services..."
-                run_on_host "$worker" "systemctl restart multipathd iscsi 2>/dev/null; systemctl enable multipathd iscsid 2>/dev/null" || true
-                log_success "  Services restarted on ${worker}"
+                log "  Restarting iscsi on ${worker}..."
+                run_on_host "$worker" "systemctl restart iscsi 2>/dev/null; systemctl enable iscsid 2>/dev/null" || true
+                log_success "  iscsi restarted on ${worker}"
             fi
         done
     fi

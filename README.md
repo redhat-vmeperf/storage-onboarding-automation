@@ -38,10 +38,12 @@ The script runs in stages that can be executed individually or all at once:
 | `collect` | Query the QUADS API, extract host/interface/MAC data to `results/` |
 | `verify` | Check that target interfaces aren't already assigned to cloud99 |
 | `jira-draft` | Generate a VLAN-change Jira request for ScaleLab ops |
-| `host-setup` | Create VLAN sub-interfaces (NNCPs on OCP) + iSCSI/multipath config |
+| `host-setup` | Create VLAN sub-interfaces (NNCPs on OCP) and the iSCSI initiator. On OCP, install multipath.conf with a worker MachineConfig |
 | `storage-setup` | Configure storage arrays: portals, volumes, hosts, LUN mappings |
 | `check` | Verify connectivity from workers to storage portal IPs |
 | `all` | Run all stages in order |
+
+On OpenShift, `host-setup` installs [`files/multipath.conf`](files/multipath.conf) as `/etc/multipath.conf` with one MachineConfig on the worker pool, and enables `multipathd`. A new or changed MachineConfig reboots every worker. `-w` limits the per-node iSCSI step only. The rollout wait is `MCP_WAIT_TIMEOUT` seconds (default 3600). Bare metal and VMware receive the same file over SSH.
 
 ### `storage-setup` Sub-stages
 
@@ -93,6 +95,7 @@ SSH_USER="core"         # auto-set from TARGET_TYPE
 LUN_SIZE="1TB"          # size per volume/LUN per vendor
 LUN_COUNT=1             # number of volumes/LUNs per vendor
 EXCLUDE_HOSTS=""        # space-separated hostnames to skip
+MCP_WAIT_TIMEOUT=3600   # seconds to wait for the worker MachineConfigPool rollout
 ```
 
 See `env/example.env` for a fully commented template.
@@ -125,6 +128,8 @@ On the provisioner node:
 
 ```
 storage-onboarding-automation/
+  files/
+    multipath.conf               # /etc/multipath.conf installed on workers
   scripts/
     setup-storage-lta.sh         # main script
     storage-lta-subnet-calc.sh   # standalone VLAN/subnet calculator
